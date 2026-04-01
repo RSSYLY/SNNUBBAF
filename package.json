@@ -1,0 +1,11 @@
+{
+  "name": "snnubbaf",
+  "version": "0.2.0",
+  "type": "module",
+  "dependencies": {
+    "@lancedb/lancedb": "^0.27.1",
+    "dotenv": "^17.3.1",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^1.1.1"
+  }
+}

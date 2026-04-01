@@ -1,0 +1,11 @@
+node_modules/
+vector-db/
+*.pdf
+temp/
+logs/
+*.log
+*.env
+source/
+source-processed/
+test*
+.github/
