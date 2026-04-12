@@ -196,16 +196,27 @@ async function callLLM(question, questionType, typeLabel, knowledge, provider) {
   }
   userContent += `【题型】${typeLabel}\n${question}`;
 
-  const body = JSON.stringify({
-    model: provider.model,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userContent },
-    ],
-    temperature: 0,
-    max_tokens: 4096,
-    stream: false,
-  });
+  const isResponsesAPI = provider.baseUrl.includes("/v1/responses");
+
+  const body = isResponsesAPI
+    ? JSON.stringify({
+        model: provider.model,
+        instructions: systemPrompt,
+        input: [
+          { role: "user", content: userContent },
+        ],
+        stream: true,
+      })
+    : JSON.stringify({
+        model: provider.model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userContent },
+        ],
+        temperature: 0,
+        max_tokens: 4096,
+        stream: false,
+      });
 
   console.log(`[LLM] model=${provider.model} | body_bytes=${Buffer.byteLength(body)} | knowledge_len=${knowledge?.length || 0} | question_len=${question.length}`);
 
@@ -234,32 +245,46 @@ async function callLLM(question, questionType, typeLabel, knowledge, provider) {
 
             let json;
             const text = data.trim();
-            if (text.startsWith("data:")) {
-              // SSE 流式：拼接所有 chunk 的 content
-              const content = text
-                .split("\n")
-                .filter((l) => l.startsWith("data:") && l.trim() !== "data: [DONE]")
-                .map((l) => {
+            if (text.startsWith("data:") || text.startsWith("event:")) {
+              const lines = text.split("\n");
+              const dataLines = lines.filter(l => l.startsWith("data:") && l.trim() !== "data: [DONE]");
+
+              // Responses API SSE: response.output_text.done 含完整文本
+              for (const line of dataLines) {
+                try {
+                  const chunk = JSON.parse(line.slice(5).trim());
+                  if (chunk.type === "response.output_text.done" && chunk.text) {
+                    const t = chunk.text.trim();
+                    if (t) { console.log(`[LLM] Responses SSE done, len=${t.length}`); resolve(t); return; }
+                  }
+                } catch {}
+              }
+
+              // Responses API SSE: 拼接所有 delta
+              const deltas = dataLines.flatMap(line => {
+                try {
+                  const chunk = JSON.parse(line.slice(5).trim());
+                  return chunk.type === "response.output_text.delta" && chunk.delta ? [chunk.delta] : [];
+                } catch { return []; }
+              });
+              if (deltas.length > 0) {
+                const joined = deltas.join("").trim();
+                if (joined) { console.log(`[LLM] Responses SSE delta, chunks=${deltas.length}, len=${joined.length}`); resolve(joined); return; }
+              }
+
+              // Chat Completions SSE: choices[].delta.content
+              const content = dataLines
+                .map(l => {
                   try {
                     const item = JSON.parse(l.slice(5).trim());
                     return item.choices?.[0]?.delta?.content || item.choices?.[0]?.message?.content || "";
                   } catch { return ""; }
                 })
                 .join("");
-              if (content) { console.log(`[LLM] SSE 提取成功, len=${content.length}`); resolve(content); return; }
-              // 尝试从第一个含 choices 的 JSON 提取
-              const sseLines = text.split("\n").filter(l => l.startsWith("data:") && l.trim() !== "data: [DONE]");
-              for (const chunk of sseLines) {
-                try {
-                  const parsed = JSON.parse(chunk.slice(5).trim());
-                  console.log(`[LLM] SSE chunk parsed: choices=${parsed.choices?.length || 0} usage=${JSON.stringify(parsed.usage || {})}`);
-                  const c = parsed.choices?.[0]?.message?.content || parsed.choices?.[0]?.delta?.content;
-                  if (c) { resolve(c); return; }
-                } catch (pe) { console.warn(`[LLM] SSE chunk parse error: ${pe.message}`); }
-              }
-              // 打印第一个 SSE chunk 的完整内容用于排查
-              if (sseLines.length) {
-                console.error(`[LLM] SSE 首个 chunk 完整内容: ${sseLines[0]}`);
+              if (content) { console.log(`[LLM] Chat SSE 提取成功, len=${content.length}`); resolve(content); return; }
+
+              if (dataLines.length) {
+                console.error(`[LLM] SSE 首个 data 行: ${dataLines[0]}`);
               }
               reject(new Error("LLM 返回空内容（可能上下文过长或模型无响应）"));
               return;
@@ -275,10 +300,21 @@ async function callLLM(question, questionType, typeLabel, knowledge, provider) {
               }
               json = JSON.parse(text.slice(firstBrace, lastBrace + 1));
             }
-            console.log(`[LLM] choices=${json.choices?.length || 0} usage=${JSON.stringify(json.usage || {})}`);
+            console.log(`[LLM] choices=${json.choices?.length || 0} output=${json.output?.length || 0} usage=${JSON.stringify(json.usage || {})}`);
+            // Chat Completions 格式
             const answer = json.choices?.[0]?.message?.content?.trim();
-            if (answer) resolve(answer);
-            else reject(new Error(`LLM 返回格式异常: ${data}`));
+            if (answer) { resolve(answer); return; }
+            // Responses API 格式: output[].content[].text
+            const outputMsg = json.output?.find(o => o.type === "message");
+            const outputText = outputMsg?.content
+              ?.filter(c => c.type === "output_text")
+              .map(c => c.text)
+              .join("")
+              .trim();
+            if (outputText) { resolve(outputText); return; }
+            // 兜底: 直接取 output_text (简化代理格式)
+            if (typeof json.output === "string" && json.output.trim()) { resolve(json.output.trim()); return; }
+            reject(new Error(`LLM 返回格式异常: ${data}`));
           } catch (e) {
             console.error(`[LLM] 解析异常: ${e.message} | raw=${data}`);
             reject(new Error(`LLM 响应解析失败: ${e.message}`));

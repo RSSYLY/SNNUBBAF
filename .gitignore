@@ -5,6 +5,7 @@ temp/
 logs/
 *.log
 *.env
+!example.env
 source/
 source-processed/
 test*
