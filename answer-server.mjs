@@ -158,21 +158,22 @@ function buildSystemPrompt(questionType, typeLabel) {
     return `${base}
 【题型：${typeLabel}】
 规则：
-1. 逐条对比每个选项，选出所有正确的选项，尽可能列出所有正确选项，宁多勿漏。
-2. 返回格式：每个正确选项的完整原文，用英文分号分隔（如：选项A原文;选项B原文）。
+1. 逐条对比每个选项，只选出知识库中有明确依据的选项，没有依据的不选。
+2. 返回格式：每个正确选项的完整原文，用中文顿号分隔（如：选项A原文、选项B原文）。
 3. 不带编号、不带字母、不加引号。
 4. 不要解释理由。
-5. 确保返回的每个选项在知识库中都有依据，不要猜测。
-6. 若知识库中找不到对应知识点，返回：无法匹配答案`;
+5. 若知识库中找不到对应知识点，返回：无法匹配答案`;
 
   } else if (questionType === "fill") {
     return `${base}
 【题型：${typeLabel}】
 规则：
-1. 根据上下文推断空白处应填写的内容。
-2. 返回的【原文】必须与知识库中的表述【完全一致】，一字不改，不得缩写、概括或改写。
-3. 不加引号，不加句号，不要解释。
-4. 如果是名词填空，返回名词本身；如果是短语，返回短语。
+1. 根据上下文推断空白处（即[ ]标记处）应填写的内容。
+2. 【关键】只返回空白处应填入的文字本身，绝对不要包含题目中[ ]前后已有的文字。
+   例如：题目"分为横向迁移与[ ]迁移"→ 正确返回"纵向"，而非"纵向迁移"。
+   例如：题目"这属于[ ]迁移现象"→ 正确返回"正"，而非"正迁移"。
+3. 返回的内容必须与知识库中的表述完全一致，一字不改，不得用同义词替换。
+4. 不加引号，不加句号，不要解释。
 5. 优先返回知识库中与空白上下文最匹配的原话。
 6. 若知识库中找不到对应知识点，返回：无法匹配答案`;
 
@@ -205,6 +206,8 @@ async function callLLM(question, questionType, typeLabel, knowledge, provider) {
         input: [
           { role: "user", content: userContent },
         ],
+        temperature: 0,
+        reasoning: { effort: "medium" },
         stream: true,
       })
     : JSON.stringify({
@@ -372,6 +375,11 @@ function cleanAnswer(raw, questionType) {
   answer = answer.replace(/^(答案[是为：: ]*|正确答案[是为：: ]*|答[：: ]*)/i, "");
   answer = answer.replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "");
 
+  // 防御性清理：模型有时会回显题目原文再接答案，此处截取 [ ] 之后的内容
+  if (answer.includes('[ ]') || answer.includes('[]')) {
+    answer = answer.replace(/^.*\]\s*[\u3002\uff0c,.\s]*/s, "");
+  }
+
   if (questionType === "choice") {
     answer = answer.replace(/^[A-Da-d0-9][\.\、\)]\s*/, "");
     answer = answer.replace(/^[""'']|[""'']$/g, "");
@@ -379,15 +387,15 @@ function cleanAnswer(raw, questionType) {
   }
   if (questionType === "multi") {
     answer = answer
-      .split(";")
+      .split(/[;；、\s]+/)
       .map(s => {
         let a = s.trim();
         a = a.replace(/^[A-Da-d0-9][\.\、\)]\s*/, "");
-        a = a.replace(/^[""'']|[""'']$/g, "");
+        a = a.replace(/^["“”'']|["“”'']$/g, "");
         return a;
       })
       .filter(Boolean)
-      .join(";");
+      .join("、");
   }
   if (questionType === "fill") {
     answer = answer.replace(/^[""'']|[""'']$/g, "");

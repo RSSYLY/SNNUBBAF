@@ -1,116 +1,220 @@
-# SNNUBBAF 专家系统后端
+# SNNUBBAF
 
-SNNUBBAF（SNNU Blackboard Auto-Fill）是一套面向 SNNU Blackboard 平台的自动答题工具，由油猴外壳脚本 + 本地 Node.js 后端 + 向量知识库三部分组成。
+SNNUBBAF（SNNU Blackboard Auto-Fill）是一套面向 SNNU Blackboard 平台的自动答题工具。它的工作方式是：
+
+1. 你把教材、答案等资料喂给它，它会把这些资料存成一个「知识库」
+2. 当你在 Blackboard 上做题时，它会从知识库中找到最相关的内容，再交给 AI 大模型来生成答案
+3. 答案会自动填入 Blackboard 的答题框中
+
+整套工具由三个部分组成：
+
+- **油猴脚本**（装在浏览器里）：负责从 Blackboard 页面上抓取题目，发送给后端，再把答案填入页面
+- **本地后端服务**（在你的电脑上运行）：接收题目 → 检索知识库 → 调用 AI 大模型 → 返回答案
+- **向量知识库**（自动生成）：把你提供的教材/答案资料转化为 AI 能快速搜索的格式
 
 ## 文件说明
 
-| 文件 | 说明 |
-|------|------|
-| `snnubbaf.user.js` | 油猴用户脚本（外壳），安装到浏览器 |
-| `snnubbaf-core.js` | 实际执行逻辑，由后端 `/script` 接口热加载 |
-| `answer-server.mjs` | 本地后端服务，提供答题 API 和向量检索 |
-| `build-kb.mjs` | 知识库向量化工具，将文档写入 LanceDB |
-| `source/` | 放置知识库原始文档（txt、md、docx、pdf 等） |
-| `vector-db/` | LanceDB 向量数据库目录（自动生成） |
+| 文件/目录 | 说明 |
+|-----------|------|
+| `snnubbaf.user.js` | 油猴用户脚本，安装到浏览器中使用 |
+| `snnubbaf-core.js` | 答题核心逻辑，由后端自动加载，不需要手动操作 |
+| `answer-server.mjs` | 本地后端服务的主程序 |
+| `build-kb.mjs` | 知识库构建工具，把你的资料转化为向量知识库 |
+| `source/` | 放置知识库原始资料的目录（把教材、答案等文件放在这里） |
+| `vector-db/` | 向量知识库的存储目录（由程序自动生成，不要手动修改） |
+| `.env` | 配置文件，存放 API Key 等敏感信息（需要你自己创建） |
+| `example.env` | 配置文件模板，复制为 `.env` 后填入你的 API Key |
 
 ---
 
-## 一、配置 API Key
+## 第一步：安装 Node.js
 
-在 `answer-server.mjs` 顶部的 `CONFIG` 对象中填写：
+本工具需要 Node.js 运行环境。如果你的电脑上还没有安装 Node.js：
 
-```js
-const CONFIG = {
-  llm: {
-    primary: {
-      baseUrl: "https://your-llm-provider/v1/chat/completions",
-      apiKey: "sk-xxxxxxxx",   // 主力 LLM 的 API Key
-      model: "gpt-4o",
-    },
-    fallback: {
-      baseUrl: "https://your-llm-provider/v1/chat/completions",
-      apiKey: "sk-xxxxxxxx",   // 备用 LLM 的 API Key（主力失败时自动切换）
-      model: "gpt-4o-mini",
-    },
-  },
+1. 访问 [Node.js 官网](https://nodejs.org/)，下载 **LTS（长期支持版）**
+2. 一路默认安装即可
+3. 安装完成后，打开终端（Windows 上叫「命令提示符」或「PowerShell」），输入以下命令验证：
+   ```bash
+   node --version
+   ```
+   如果显示类似 `v22.x.x` 的版本号，说明安装成功。
 
-  embedding: {
-    baseUrl: "https://open.bigmodel.cn/api/paas/v4/embeddings",
-    apiKey: "your-zhipu-api-key",   // 智谱 AI Embedding API Key
-    model: "embedding-3",
-  },
-};
+---
+
+## 第二步：安装依赖
+
+打开终端，进入本项目的目录，运行：
+
+```bash
+npm install
 ```
 
-> **LLM（主力 / 备用）**：兼容 OpenAI chat/completions 接口的任意提供商均可，包括 OpenAI、DeepSeek、通义千问等中转服务。  
-> **Embedding**：默认使用智谱 AI `embedding-3`，需要在 [open.bigmodel.cn](https://open.bigmodel.cn) 申请 API Key。若更换 Embedding 提供商，同步修改 `ingest.mjs` 中的 `CONFIG.embedding`，并**重新运行 ingest 建库**。
+这个命令会自动下载本项目需要的所有第三方库。只需要运行一次，后续不用重复执行。
 
 ---
 
-## 二、向量化知识库
+## 第三步：配置 API Key
 
-1. 将原始文档（`.txt` `.md` `.docx` `.pdf` `.csv` `.json`）放入 `source/` 目录。
+本工具需要两种 AI 服务的 API Key：
 
-2. 安装依赖（首次）：
+- **大语言模型（LLM）**：用来根据题目和知识库内容生成答案（例如 GPT、GLM 等）
+- **文本向量化（Embedding）**：用来把文字转化为数字向量，让知识库能被快速检索（默认使用智谱 AI）
+
+### 操作步骤
+
+1. 在项目目录下找到 `example.env` 文件
+2. 复制一份，重命名为 `.env`（注意文件名以点号开头）：
    ```bash
-   npm install
+   cp example.env .env
    ```
+3. 用文本编辑器（记事本、VS Code 等均可）打开 `.env`，把 `your-xxx-api-key-here` 替换为你的实际 API Key
 
-3. 运行向量化：
-   ```bash
-   node build-kb.mjs
-   ```
-   脚本会读取 `source/` 下所有文档，分块后调用 Embedding API 写入 `vector-db/`。
+### 配置项说明
 
-4. 成功后终端会输出类似：
-   ```
-   ═══ SNNUBBAF 知识库向量化 ═══
-   ✔ 第四章正确答案.txt → 12 块
-   ✔ 共写入 12 个向量块
-   ```
+`.env` 文件中每一行都是一个配置项，格式为 `配置名=值`。以 `#` 开头的行是注释，不会生效。
 
-> 每次修改 `source/` 中的文档后，重新运行 `node ingest.mjs` 即可更新知识库。也可在后端运行时 `POST /reload` 热刷新。
+**必填项**（不填则无法运行）：
+
+| 配置项 | 说明 | 到哪里获取 |
+|--------|------|-----------|
+| `EMBEDDING_API_KEY` | 智谱 AI 的 Embedding API Key，用于知识库构建 | [open.bigmodel.cn](https://open.bigmodel.cn) 注册后在控制台获取 |
+| `LLM_PRIMARY_API_KEY` | 主力大模型的 API Key，用于答题 | 取决于你使用的 LLM 提供商 |
+| `LLM_FALLBACK_API_KEY` | 备用大模型的 API Key，主力模型不可用时自动切换 | 同上 |
+| `BUILD_LLM_API_KEY` | 构建知识库时概念提取用的 API Key（默认关闭概念提取，可暂不填） | 同上 |
+
+**选填项**（有默认值，大多数情况下不需要修改）：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `LLM_PRIMARY_BASE_URL` | `https://mydamoxing.cn/v1/responses` | 主力 LLM 的接口地址 |
+| `LLM_PRIMARY_MODEL` | `gpt-5.1` | 主力模型名称 |
+| `LLM_FALLBACK_BASE_URL` | `https://mydamoxing.cn/v1/chat/completions` | 备用 LLM 的接口地址 |
+| `LLM_FALLBACK_MODEL` | `glm-5` | 备用模型名称 |
+| `EMBEDDING_BASE_URL` | `https://open.bigmodel.cn/api/paas/v4/embeddings` | Embedding 接口地址 |
+| `EMBEDDING_MODEL` | `embedding-3` | Embedding 模型名称 |
+| `PORT` | `38765` | 后端服务监听的端口号 |
+| `TOP_K` | `5` | 每次答题从知识库中检索的相关段落数量 |
+| `CHUNK_SIZE` | `1200` | 知识库分块大小（字符数） |
+| `CHUNK_OVERLAP` | `300` | 相邻分块的重叠字符数，防止关键信息被截断 |
+| `EXTRACT_CONCEPTS` | `false` | 是否在构建知识库时提取概念索引（调用 LLM，耗时较长） |
+
+> **什么是 API Key？**  
+> API Key 是一串字符（类似密码），用来证明你有权调用某个 AI 服务。每个 AI 服务提供商（如智谱 AI、OpenAI 等）都会在你注册后提供 API Key。它是计费凭证——调用 AI 服务会按用量扣费，所以 **不要把 API Key 分享给别人**。`.env` 文件已被 `.gitignore` 排除，不会被上传到 GitHub。
+
+> **什么是 LLM 接口地址？**  
+> 不同的 AI 服务提供商提供不同的接口格式。`BASE_URL` 指定了你的 AI 服务的网络地址。如果你使用的提供商兼容 OpenAI 的接口格式（大多数国内中转站都兼容），只需填对 URL 即可。主力模型使用 Responses API 格式（`/v1/responses`），备用模型使用 Chat Completions API 格式（`/v1/chat/completions`）。
 
 ---
 
-## 三、启动后端
+## 第四步：准备知识库资料
+
+将你的教材、讲义、答案等资料以 `.txt` 文本文件的形式放入 `source/` 目录。
+
+### 支持的资料类型
+
+系统会根据文件的内容和命名自动识别两种资料类型：
+
+**1. 教材/讲义类**
+
+普通的文本资料。如果文件中包含「第X章」「第X节」这样的标记，系统会自动按章节拆分存储；如果没有章节标记，则按固定长度切分。
+
+这类资料为 AI 提供背景知识和上下文——AI 回答问题时，会先从知识库中搜索相关段落，再基于这些内容作答。
+
+**2. 答案/题库类（Q&A 模式）**
+
+文件名中包含 **"答案"** 二字的文件会被自动识别为答案文件。系统会把文件中的每道题单独存储为一个检索单元，这样当遇到相同或相似的题目时，AI 能直接命中标准答案，大幅提高准确率。
+
+答案文件中每道题的格式为：`序号. 题目内容答案内容`，一行一道题。例如：
+
+```
+1. 奥苏贝尔认为，不断分化和[ ]是认知组织的基本原则。综合贯通
+2. 柯勒的"小鸡啄米"实验支持的迁移理论是[ ]。关系转换说
+3. 下列属于正迁移的是[ ]。数学审题技能的掌握对物理、化学审题的影响
+```
+
+在知识库中，这些 chunk 的 `source` 字段会自动加上 `[Q&A]` 前缀，方便区分来源。
+
+### 提高准确率的建议
+
+- **教材 + 答案结合**是最有效的策略：教材提供完整的知识上下文，答案文件提供精确的标准答案
+- 答案文件的命名必须包含"答案"二字，例如 `第七章测试答案.txt`、`期中考试答案.txt`
+- 教材越完整、答案覆盖的题目越多，准确率越高
+- 每个章节的答案可以单独一个文件，也可以合并为一个文件
+
+---
+
+## 第五步：构建知识库
+
+资料准备好后，运行以下命令将资料转化为向量知识库：
+
+```bash
+node build-kb.mjs
+```
+
+这个命令会依次执行三个阶段：
+
+1. **预处理**：读取 `source/` 下的所有文件，按章节或题目拆分为小段落
+2. **概念提取**（默认跳过）：调用 LLM 从段落中提取关键概念。如需开启，可运行 `node build-kb.mjs --with-concepts`
+3. **向量入库**：调用智谱 Embedding API 将每个段落转化为数字向量，写入 `vector-db/`
+
+构建成功后，终端会输出类似信息：
+
+```
+✅ 入库完成: 541 个向量块 → vector-db
+```
+
+> **什么是向量？**  
+> 向量是一组数字，用来表示一段文字的「含义」。含义相近的文字，向量也相近。构建知识库时，每段资料都会被转化为一个向量。答题时，题目也会被转化为向量，然后和知识库中的向量做比较，找出含义最接近的段落——这就是「向量检索」。
+
+> **每次修改 `source/` 中的资料后**，需要重新运行 `node build-kb.mjs` 来更新知识库。也可以在后端运行时访问 `POST /reload` 接口来热刷新。
+
+> **部分运行**：如果只想重新执行某个阶段，可以用 `--only` 参数，例如 `node build-kb.mjs --only ingest` 只执行向量入库。
+
+---
+
+## 第六步：启动后端
 
 ```bash
 node answer-server.mjs
 ```
 
-后端监听 `http://127.0.0.1:38765`，启动成功后输出：
+启动成功后，终端会显示类似信息：
 
 ```
 ╔══════════════════════════════════════════════════╗
 ║  SNNUBBAF 专家系统后端                           ║
 ╠══════════════════════════════════════════════════╣
 ║  地址: http://127.0.0.1:38765                    ║
-║  主模型: gpt-4o                                  ║
-║  备用: gpt-4o-mini                               ║
+║  主模型: gpt-5.1                                 ║
+║  备用: glm-5                                     ║
 ║  检索: 向量检索 (LanceDB)                        ║
 ╚══════════════════════════════════════════════════╝
 ```
 
-> 若检索行显示"未加载"，说明 `vector-db/` 不存在或为空，请先执行第二步向量化。
+后端会在你的电脑上持续运行，等待浏览器发来的答题请求。**关闭终端窗口会停止后端**，所以答题时需要保持终端窗口打开。
+
+如果检索行显示"未加载"，说明知识库还没有构建，请先完成第五步。
 
 ---
 
-## 四、安装油猴脚本
+## 第七步：安装油猴脚本
 
-1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/)。
-2. 新建用户脚本，复制 `snnubbaf.user.js` 全部内容粘贴保存。
-3. 确保本地后端已在运行（步骤三）。
-4. 访问 `https://bb.snnu.edu.cn/` 任一答题页，油猴菜单中会出现"开始"和"开始自动翻页答题"选项。
+1. 在浏览器中安装 [Tampermonkey](https://www.tampermonkey.net/) 扩展（支持 Chrome、Edge、Firefox）
+2. 点击 Tampermonkey 图标 → 「添加新脚本」
+3. 删掉编辑器中的默认内容，把 `snnubbaf.user.js` 的全部内容粘贴进去，保存
+4. 确保本地后端正在运行（第六步）
+5. 访问 `https://bb.snnu.edu.cn/` 的任意答题页面，Tampermonkey 菜单中会出现「开始」和「开始自动翻页答题」选项
 
 ---
 
-## API 接口
+## API 接口参考
+
+后端提供以下 HTTP 接口（一般不需要手动调用，油猴脚本会自动调用）：
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `POST` | `/ask` | 答题：`{ question, type }` |
-| `GET` | `/script` | 返回 `snnubbaf-core.js`（热重载） |
-| `GET` | `/health` | 健康检查 |
-| `POST` | `/reload` | 热刷新知识库 + 向量库 |
+| `POST` | `/ask` | 提交题目获取答案。请求体：`{ "question": "题目文本", "type": "单选/多选/填空/判断" }` |
+| `GET` | `/script` | 获取油猴核心脚本（浏览器自动调用） |
+| `GET` | `/health` | 健康检查，返回后端状态和知识库信息 |
+| `POST` | `/reload` | 热刷新知识库，无需重启后端即可加载新资料 |
 

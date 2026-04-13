@@ -385,6 +385,41 @@ async function extractConcepts() {
 //  Step 3 — 向 量 入 库
 // ════════════════════════════════════════════════════════
 
+/** 根据文件名判断是否为 Q&A 格式（文件名含"答案"） */
+function isQAFile(filename) {
+  return /答案/.test(filename);
+}
+
+/** 将 Q&A 格式文件切分为单个问答对 chunk（每题独立，提升检索精度） */
+function chunkQA(text, source) {
+  const chunks = [];
+  let metaPrefix = "";
+  let chapter = "";
+
+  const metaMatch = text.match(/^\[(章节|概念索引|来源): ([^\]]+)\]\n/);
+  if (metaMatch) {
+    metaPrefix = metaMatch[2].trim();
+    chapter = metaPrefix.split(">")[0]?.trim() || "";
+  }
+
+  for (const line of text.split("\n")) {
+    const m = line.trim().match(/^(\d+)\.\s+(.+)/);
+    if (!m) continue;
+    const content = m[2];
+    const chunkBody = metaPrefix
+      ? `[Q&A: ${metaPrefix}]\n${content}`
+      : content;
+
+    chunks.push({
+      text: chunkBody,
+      source: "[Q&A] " + source,
+      chapter,
+      section: "Q&A",
+    });
+  }
+  return chunks;
+}
+
 function chunkText(text, source) {
   let metaPrefix = "";
   let chapter = "";
@@ -423,14 +458,24 @@ function chunkText(text, source) {
 
 async function embedOne(input, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
-    const resp = await fetch(CONFIG.embedding.baseUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${CONFIG.embedding.apiKey}`,
-      },
-      body: JSON.stringify({ model: CONFIG.embedding.model, input }),
-    });
+    let resp;
+    try {
+      resp = await fetch(CONFIG.embedding.baseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${CONFIG.embedding.apiKey}`,
+        },
+        body: JSON.stringify({ model: CONFIG.embedding.model, input }),
+      });
+    } catch (e) {
+      if (attempt < retries) {
+        console.warn(`  ⚠ embedding 网络错误 (${e.message}), ${attempt * 2}s 后重试 (${attempt}/${retries})...`);
+        await sleep(attempt * 2000);
+        continue;
+      }
+      throw new Error(`Embedding 网络错误 (重试 ${retries} 次后仍失败): ${e.message}`);
+    }
 
     if (resp.ok) {
       const data = await resp.json();
@@ -439,8 +484,8 @@ async function embedOne(input, retries = 3) {
 
     const err = await resp.text();
     if (attempt < retries) {
-      console.warn(`  ⚠ embedding 第 ${attempt} 次失败 (${resp.status}), ${attempt * 1000}ms 后重试...`);
-      await sleep(attempt * 1000);
+      console.warn(`  ⚠ embedding 第 ${attempt} 次失败 (${resp.status}), ${attempt * 2}s 后重试...`);
+      await sleep(attempt * 2000);
     } else {
       throw new Error(`Embedding API 错误 ${resp.status}: ${err}`);
     }
@@ -503,8 +548,14 @@ async function ingest() {
   for (const f of files) {
     const rel = path.basename(f);
     const content = fs.readFileSync(f, "utf-8");
-    const chunks = chunkText(content, rel);
-    console.log(`  ${rel}: ${content.length} 字 → ${chunks.length} 块`);
+    let chunks;
+    if (isQAFile(rel)) {
+      chunks = chunkQA(content, rel);
+      console.log(`  ${rel}: ${content.length} 字 → ${chunks.length} 个Q&A对`);
+    } else {
+      chunks = chunkText(content, rel);
+      console.log(`  ${rel}: ${content.length} 字 → ${chunks.length} 块`);
+    }
     allChunks.push(...chunks);
   }
 
