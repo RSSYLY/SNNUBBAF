@@ -1,6 +1,6 @@
 import { connect } from "@lancedb/lancedb";
+import OpenAI from "openai";
 import http from "node:http";
-import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -61,21 +61,23 @@ const CONFIG = {
 
   llm: {
     primary: {
-      baseUrl: process.env.LLM_PRIMARY_BASE_URL ?? "https://mydamoxing.cn/v1/chat/completions",
+      baseUrl: process.env.LLM_PRIMARY_BASE_URL ?? "https://mydamoxing.cn/v1",
+      apiType: process.env.LLM_PRIMARY_API_TYPE ?? "completions", // "responses" | "completions"
       apiKey: process.env.LLM_PRIMARY_API_KEY,
       model: process.env.LLM_PRIMARY_MODEL ?? "MiniMax-M2.5",
     },
     fallback: {
-      baseUrl: process.env.LLM_FALLBACK_BASE_URL ?? "https://mydamoxing.cn/v1/chat/completions",
+      baseUrl: process.env.LLM_FALLBACK_BASE_URL ?? "https://mydamoxing.cn/v1",
+      apiType: process.env.LLM_FALLBACK_API_TYPE ?? "completions",
       apiKey: process.env.LLM_FALLBACK_API_KEY,
       model: process.env.LLM_FALLBACK_MODEL ?? "glm-5",
     },
   },
 
   embedding: {
-    baseUrl: process.env.EMBEDDING_BASE_URL ?? "https://open.bigmodel.cn/api/paas/v4/embeddings",
-    apiKey: process.env.EMBEDDING_API_KEY,
-    model: process.env.EMBEDDING_MODEL ?? "embedding-3",
+    baseUrl: process.env.QUERY_EMBEDDING_BASE_URL ?? "https://open.bigmodel.cn/api/paas/v4",
+    apiKey: process.env.QUERY_EMBEDDING_API_KEY ?? process.env.EMBEDDING_API_KEY,
+    model: process.env.QUERY_EMBEDDING_MODEL ?? process.env.EMBEDDING_MODEL ?? "embedding-3",
   },
 
   dbDir: path.join(__dirname, process.env.DB_DIR ?? "vector-db"),
@@ -104,21 +106,20 @@ async function loadVectorDB() {
   }
 }
 
+const embeddingClient = new OpenAI({
+  baseURL: CONFIG.embedding.baseUrl,
+  apiKey: CONFIG.embedding.apiKey,
+  timeout: 30000,
+  maxRetries: 2,
+});
+
 async function embedQuery(text) {
-  const resp = await fetch(CONFIG.embedding.baseUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${CONFIG.embedding.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: CONFIG.embedding.model,
-      input: [text],
-    }),
+  const result = await embeddingClient.embeddings.create({
+    model: CONFIG.embedding.model,
+    input: [text],
+    encoding_format: "float",
   });
-  if (!resp.ok) throw new Error(`Embedding API ${resp.status}`);
-  const data = await resp.json();
-  return data.data[0].embedding;
+  return result.data[0].embedding;
 }
 
 async function vectorSearch(question, topK) {
@@ -185,8 +186,23 @@ function buildSystemPrompt(questionType, typeLabel) {
 }
 
 // ============================================================
-//  LLM 调 用
+//  LLM 调 用（openai SDK）
 // ============================================================
+
+function createLLMClient(providerCfg) {
+  return new OpenAI({
+    baseURL: providerCfg.baseUrl,
+    apiKey: providerCfg.apiKey,
+    timeout: 15000,
+    maxRetries: 0, // 调用封装里自行处理重试逻辑
+  });
+}
+
+const llmClients = new Map();
+function getClient(provider) {
+  if (!llmClients.has(provider)) llmClients.set(provider, createLLMClient(provider));
+  return llmClients.get(provider);
+}
 
 async function callLLM(question, questionType, typeLabel, knowledge, provider) {
   const systemPrompt = buildSystemPrompt(questionType, typeLabel);
@@ -197,140 +213,38 @@ async function callLLM(question, questionType, typeLabel, knowledge, provider) {
   }
   userContent += `【题型】${typeLabel}\n${question}`;
 
-  const isResponsesAPI = provider.baseUrl.includes("/v1/responses");
+  const client = getClient(provider);
+  const isResponsesAPI = provider.apiType === "responses";
 
-  const body = isResponsesAPI
-    ? JSON.stringify({
-        model: provider.model,
-        instructions: systemPrompt,
-        input: [
-          { role: "user", content: userContent },
-        ],
-        temperature: 0,
-        reasoning: { effort: "medium" },
-        stream: true,
-      })
-    : JSON.stringify({
-        model: provider.model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userContent },
-        ],
-        temperature: 0,
-        max_tokens: 4096,
-        stream: false,
-      });
+  console.log(`[LLM] model=${provider.model} | knowledge_len=${knowledge?.length || 0} | question_len=${question.length} | api=${isResponsesAPI ? "responses" : "chat"}`);
 
-  console.log(`[LLM] model=${provider.model} | body_bytes=${Buffer.byteLength(body)} | knowledge_len=${knowledge?.length || 0} | question_len=${question.length}`);
+  let answer;
+  if (isResponsesAPI) {
+    const response = await client.responses.create({
+      model: provider.model,
+      instructions: systemPrompt,
+      input: [{ role: "user", content: userContent }],
+      temperature: 0,
+      reasoning: { effort: "medium" },
+    });
+    answer = response.output_text;
+    console.log(`[LLM] Responses API done, usage=${JSON.stringify(response.usage || {})}, len=${answer?.length || 0}`);
+  } else {
+    const completion = await client.chat.completions.create({
+      model: provider.model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      temperature: 0,
+      max_tokens: 4096,
+    });
+    answer = completion.choices?.[0]?.message?.content?.trim();
+    console.log(`[LLM] Chat Completions done, usage=${JSON.stringify(completion.usage || {})}, len=${answer?.length || 0}`);
+  }
 
-  const url = new URL(provider.baseUrl);
-  const transport = url.protocol === "https:" ? https : http;
-
-  return new Promise((resolve, reject) => {
-    const req = transport.request(
-      {
-        hostname: url.hostname,
-        port: url.port || (url.protocol === "https:" ? 443 : 80),
-        path: url.pathname + url.search,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${provider.apiKey}`,
-        },
-        timeout: 60000,
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          try {
-            console.log(`[LLM] status=${res.statusCode} | resp_bytes=${data.length} | resp_full=${data}`);
-
-            let json;
-            const text = data.trim();
-            if (text.startsWith("data:") || text.startsWith("event:")) {
-              const lines = text.split("\n");
-              const dataLines = lines.filter(l => l.startsWith("data:") && l.trim() !== "data: [DONE]");
-
-              // Responses API SSE: response.output_text.done 含完整文本
-              for (const line of dataLines) {
-                try {
-                  const chunk = JSON.parse(line.slice(5).trim());
-                  if (chunk.type === "response.output_text.done" && chunk.text) {
-                    const t = chunk.text.trim();
-                    if (t) { console.log(`[LLM] Responses SSE done, len=${t.length}`); resolve(t); return; }
-                  }
-                } catch {}
-              }
-
-              // Responses API SSE: 拼接所有 delta
-              const deltas = dataLines.flatMap(line => {
-                try {
-                  const chunk = JSON.parse(line.slice(5).trim());
-                  return chunk.type === "response.output_text.delta" && chunk.delta ? [chunk.delta] : [];
-                } catch { return []; }
-              });
-              if (deltas.length > 0) {
-                const joined = deltas.join("").trim();
-                if (joined) { console.log(`[LLM] Responses SSE delta, chunks=${deltas.length}, len=${joined.length}`); resolve(joined); return; }
-              }
-
-              // Chat Completions SSE: choices[].delta.content
-              const content = dataLines
-                .map(l => {
-                  try {
-                    const item = JSON.parse(l.slice(5).trim());
-                    return item.choices?.[0]?.delta?.content || item.choices?.[0]?.message?.content || "";
-                  } catch { return ""; }
-                })
-                .join("");
-              if (content) { console.log(`[LLM] Chat SSE 提取成功, len=${content.length}`); resolve(content); return; }
-
-              if (dataLines.length) {
-                console.error(`[LLM] SSE 首个 data 行: ${dataLines[0]}`);
-              }
-              reject(new Error("LLM 返回空内容（可能上下文过长或模型无响应）"));
-              return;
-            }
-            // 非 SSE 格式
-            try {
-              json = JSON.parse(text);
-            } catch {
-              const firstBrace = text.indexOf("{");
-              const lastBrace = text.lastIndexOf("}");
-              if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-                throw new Error("未找到可解析的 JSON 片段");
-              }
-              json = JSON.parse(text.slice(firstBrace, lastBrace + 1));
-            }
-            console.log(`[LLM] choices=${json.choices?.length || 0} output=${json.output?.length || 0} usage=${JSON.stringify(json.usage || {})}`);
-            // Chat Completions 格式
-            const answer = json.choices?.[0]?.message?.content?.trim();
-            if (answer) { resolve(answer); return; }
-            // Responses API 格式: output[].content[].text
-            const outputMsg = json.output?.find(o => o.type === "message");
-            const outputText = outputMsg?.content
-              ?.filter(c => c.type === "output_text")
-              .map(c => c.text)
-              .join("")
-              .trim();
-            if (outputText) { resolve(outputText); return; }
-            // 兜底: 直接取 output_text (简化代理格式)
-            if (typeof json.output === "string" && json.output.trim()) { resolve(json.output.trim()); return; }
-            reject(new Error(`LLM 返回格式异常: ${data}`));
-          } catch (e) {
-            console.error(`[LLM] 解析异常: ${e.message} | raw=${data}`);
-            reject(new Error(`LLM 响应解析失败: ${e.message}`));
-          }
-        });
-      }
-    );
-    req.on("error", (e) => console.error(`[LLM] 网络错误: ${e.message}`));
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("LLM 请求超时 (60s)")); });
-    req.write(body);
-    req.end();
-  });
+  if (!answer) throw new Error("LLM 返回空内容（可能上下文过长或模型无响应）");
+  return answer;
 }
 
 // ── 带 fallback 的调用封装 ──────────────────────────
@@ -352,12 +266,12 @@ async function callLLMWithFallback(question, questionType, typeLabel, knowledge)
   }
 
   if (useFallback) {
-    // fallback 模型：超时时重试一次
+    // fallback 模型：超时/网络错误时重试一次
     try {
       return await callLLM(question, questionType, typeLabel, knowledge, CONFIG.llm.fallback);
     } catch (e2) {
-      if (e2.message.includes("超时") || e2.message.includes("hang up")) {
-        console.warn(`[LLM] 备用模型超时，等待 2s 后重试...`);
+      if (e2 instanceof OpenAI.APIConnectionTimeoutError || e2 instanceof OpenAI.APIConnectionError) {
+        console.warn(`[LLM] 备用模型网络/超时错误，等待 2s 后重试...`);
         await new Promise((r) => setTimeout(r, 2000));
         return await callLLM(question, questionType, typeLabel, knowledge, CONFIG.llm.fallback);
       }
