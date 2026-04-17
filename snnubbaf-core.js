@@ -1,10 +1,13 @@
 // SNNUBBAF 专家系统 - 主逻辑（由后端 /script 提供）
 // 在油猴薄壳中运行，上下文有 __SNNUBBAF_API__ 全局变量
+//
+// 流程：收集所有题目 → 一次性批量请求 → 返回第一题 → 逐题填充
 
 (function () {
   "use strict";
 
-  // GM API 桥接：通过 CustomEvent 与 TM 沙盒通信（跨隔离边界的标准方案）
+  // ── GM API 桥接：通过 CustomEvent 与 TM 沙盒通信 ──
+
   let _menuSeq = 0;
   const _menuCallbacks = new Map();
 
@@ -28,45 +31,27 @@
   const API_URL = window.__SNNUBBAF_API__;
   if (!API_URL) { window.alert("SNNUBBAF: 未配置 API 地址"); return; }
 
-  // ── 自动翻页常量 ──────────────────────────────────
+  // ── 常量 ──────────────────────────────────────────
 
-  const SBB_KEY   = "snnubbaf";
-  const TC_KEY    = "snnubbaf_turn_count";
-  const EC_KEY    = "snnubbaf_err_count";
-  const MAX_TURNS = 49;
-  const MAX_ERR   = 3;
-
-  // ── 题型 ──────────────────────────────────────────
+  const MODE_KEY     = "snnubbaf_mode";        // "pre-collecting" | "collecting" | "filling"
+  const QUESTIONS_KEY = "snnubbaf_questions";   // JSON: [{question, type, typeLabel}]
+  const ANSWERS_KEY  = "snnubbaf_answers";      // JSON: [answer, ...]
+  const FILL_IDX_KEY = "snnubbaf_fill_idx";     // 当前填充位置
+  const ERR_KEY      = "snnubbaf_err_count";    // 连续错误计数
+  const MAX_ERR      = 5;
+  const MAX_PAGES    = 100;
 
   const TYPE_LABELS = {
-    choice: "单选题",
-    fill: "填空题",
-    multi: "多选题",
-    unknown: "未知题型",
+    choice: "单选题", fill: "填空题", multi: "多选题", unknown: "未知题型",
   };
 
-  const state = {
-    isRunning: false,
-    isProcessing: false,
-    menuCommandId: null,
-    apStartId: null,
-    apStopId: null,
-    apTimer: null,
-  };
+  // ── 状态管理 ──────────────────────────────────────
 
-  // ── 自动翻页 sessionStorage 管理 ─────────────────
-
-  function isAutoPage()    { return sessionStorage.getItem(SBB_KEY) === "1"; }
-  function setAutoPageOn() { sessionStorage.setItem(SBB_KEY, "1"); }
-  function setAutoPageOff(){ sessionStorage.removeItem(SBB_KEY); sessionStorage.removeItem(TC_KEY); sessionStorage.removeItem(EC_KEY); }
-
-  function getTurnCount() { return parseInt(sessionStorage.getItem(TC_KEY) || "0", 10); }
-  function getErrCount()  { return parseInt(sessionStorage.getItem(EC_KEY) || "0", 10); }
-
-  function cleanAutoPage() {
-    clearTimeout(state.apTimer);
-    state.apTimer = null;
-    setAutoPageOff();
+  function getMode()  { return sessionStorage.getItem(MODE_KEY); }
+  function setMode(m) { m ? sessionStorage.setItem(MODE_KEY, m) : sessionStorage.removeItem(MODE_KEY); }
+  function cleanup() {
+    [MODE_KEY, QUESTIONS_KEY, ANSWERS_KEY, FILL_IDX_KEY, ERR_KEY]
+      .forEach(k => sessionStorage.removeItem(k));
   }
 
   // ── 文本处理 ──────────────────────────────────────
@@ -93,109 +78,12 @@
     return text;
   }
 
-  /** 模糊匹配：去标点去空格后对比 */
   function fuzzyMatch(a, b) {
     const strip = s => normalizeText(s).replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, "");
     return strip(a) === strip(b);
   }
 
-  // ── API ────────────────────────────────────────────
-
-  async function fetchAnswer(question, type) {
-    const typeLabel = TYPE_LABELS[type] || type;
-    const resp = await fetch(API_URL + "/ask", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, type, typeLabel }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || `API 返回 ${resp.status}`);
-    }
-    const data = await resp.json();
-    if (!data.answer) throw new Error("API 返回空答案");
-    return data.answer;
-  }
-
-  // ── 菜单（答题 / 自动翻页）─────────────────────
-
-  function registerToggleMenu() {
-    if (state.menuCommandId !== null) {
-      try { GM_UNREG(state.menuCommandId); } catch (_e) {}
-    }
-    const label = state.isRunning ? "停止" : "开始";
-    state.menuCommandId = GM_REG(label, () => {
-      if (state.isRunning) {
-        state.isRunning = false;
-        state.isProcessing = false;
-        registerToggleMenu();
-        window.alert("已停止自动填充。");
-        return;
-      }
-      startExecution(false);
-    });
-  }
-
-  function registerAutoPageMenus() {
-    // 清理旧菜单
-    if (state.apStartId !== null) { try { GM_UNREG(state.apStartId); } catch (_e) {} }
-    if (state.apStopId  !== null) { try { GM_UNREG(state.apStopId); }  catch (_e) {} }
-
-    if (!isAutoPage()) {
-      // 未激活 → 显示"开始"菜单
-      state.apStartId = GM_REG("开始自动翻页答题", () => {
-        setAutoPageOn();
-        sessionStorage.setItem(TC_KEY, "0");
-        sessionStorage.setItem(EC_KEY, "0");
-        registerAutoPageMenus();
-        window.alert("自动翻页答题已启动，将自动完成当前页后翻页。");
-        startExecution(true);
-      });
-      state.apStopId = null;
-    } else {
-      // 已激活 → 显示"停止"菜单
-      state.apStopId = GM_REG("停止自动翻页答题", () => {
-        clearTimeout(state.apTimer);
-        state.apTimer = null;
-        state.isRunning = false;
-        state.isProcessing = false;
-        setAutoPageOff();
-        registerAutoPageMenus();
-        registerToggleMenu();
-        window.alert("自动翻页答题已停止。");
-      });
-      state.apStartId = null;
-    }
-  }
-
-  // ── ❤ 按 钮 ──────────────────────────────────────
-
-  function injectButton() {
-    const anchor = document.querySelector("#navpaging_bottom > span:nth-child(3)");
-    if (!anchor || document.getElementById("snnubbaf-heart-btn")) return;
-
-    const btn = document.createElement("span");
-    btn.id = "snnubbaf-heart-btn";
-    btn.textContent = "❤";
-    btn.title = "自动答题";
-    btn.style.cssText =
-      "cursor:pointer;font-size:24px;vertical-align:middle;margin-left:8px;color:#e74c3c;user-select:none;";
-    btn.addEventListener("click", () => {
-      if (state.isProcessing) {
-        window.alert("脚本正在执行，请稍候。");
-        return;
-      }
-      startExecution(false);
-    });
-    anchor.after(btn);
-  }
-
-  // 轮询注入（因为页面可能动态加载分页栏）
-  injectButton();
-  const btnTimer = setInterval(injectButton, 1500);
-  setTimeout(() => clearInterval(btnTimer), 30000);
-
-  // ── DOM ────────────────────────────────────────────
+  // ── DOM 操作 ──────────────────────────────────────
 
   function getCurrentQuestionContainer() {
     const root = document.querySelector("#dataCollectionContainer");
@@ -254,13 +142,24 @@
     return "unknown";
   }
 
+  // ── 导航 ──────────────────────────────────────────
+
+  function getNextPageButton() {
+    const btn = document.querySelector("#navpaging_bottom > button:nth-child(5)");
+    return btn && !btn.disabled ? btn : null;
+  }
+
+  function getFirstPageButton() {
+    const btn = document.querySelector("#navpaging_bottom > button:nth-child(1)");
+    return btn && !btn.disabled ? btn : null;
+  }
+
   // ── 填 写 ─────────────────────────────────────────
 
   function fillTextQuestion(fieldset, answer) {
     const input = fieldset.querySelector('input[type="text"]');
     if (!input) throw new Error("未找到填空输入框");
     input.focus();
-    // 先清空再赋值，确保 change 事件触发
     input.value = "";
     input.dispatchEvent(new Event("input", { bubbles: true }));
     input.value = answer;
@@ -271,30 +170,26 @@
 
   function clickChoices(fieldset, answer, isMulti) {
     const targets = isMulti
-      ? answer.split(";").map(s => s.trim()).filter(Boolean)
+      ? answer.split(/[;；、]+/).map(s => s.trim()).filter(Boolean)
       : [answer.trim()];
 
-    // 收集所有 checkbox/radio + 对应的 label 文本
     const inputs = Array.from(fieldset.querySelectorAll('input[type="checkbox"], input[type="radio"]'));
     const optionMap = [];
-    for (const input of inputs) {
-      const id = input.id;
+    for (const inp of inputs) {
+      const id = inp.id;
       const label = id ? fieldset.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
       const text = label ? (label.textContent || "").trim() : "";
-      optionMap.push({ input, text });
+      optionMap.push({ inp, text });
     }
 
     const matched = [];
-
     for (const target of targets) {
       let found = false;
-      for (const { input, text } of optionMap) {
+      for (const { inp, text } of optionMap) {
         if (!fuzzyMatch(text, target)) continue;
-
-        // 设置勾选状态
-        input.checked = true;
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-        input.dispatchEvent(new Event("click", { bubbles: true }));
+        inp.checked = true;
+        inp.dispatchEvent(new Event("change", { bubbles: true }));
+        inp.dispatchEvent(new Event("click", { bubbles: true }));
         matched.push(target);
         found = true;
         break;
@@ -302,162 +197,241 @@
       if (!found) console.warn(`[SNNUBBAF] 未匹配选项: "${target}"`);
     }
 
-    if (!matched.length) {
-      throw new Error(`未找到匹配选项: ${targets.join("; ")}`);
-    }
+    if (!matched.length) throw new Error(`未找到匹配选项: ${targets.join("; ")}`);
     return matched;
   }
 
-  // ── 处 理 单 题 ──────────────────────────────────
+  // ── 题目提取 ──────────────────────────────────────
 
-  async function processQuestion() {
+  function extractCurrentQuestion() {
     const container = getCurrentQuestionContainer();
     if (!container) throw new Error("未找到当前题目容器");
-
     const fieldset = container.querySelector("fieldset");
     if (!fieldset) throw new Error("未找到题目 fieldset");
-
     const title = extractTitle(fieldset);
     if (!title) throw new Error("未提取到题目标题");
-
     const type = detectQuestionType(fieldset);
-    console.log(`[SNNUBBAF] 题型: ${TYPE_LABELS[type] || type} | ${title.slice(0, 40)}...`);
-
     const options = type !== "fill" ? extractOptions(fieldset) : [];
     const fullQuestion = buildFullQuestion(title, options);
-    console.log(`[SNNUBBAF] 题目: ${fullQuestion.slice(0, 80)}...`);
+    return { question: fullQuestion, type, typeLabel: TYPE_LABELS[type] || type };
+  }
 
-    const answer = await fetchAnswer(fullQuestion, type);
-    if (answer === "无法匹配答案") {
-      throw new Error("知识库中未找到该题答案");
-    }
-    console.log(`[SNNUBBAF] 答案: ${answer}`);
+  // ── 答案填充（单题）──────────────────────────────
+
+  function fillCurrentQuestion(answer) {
+    const container = getCurrentQuestionContainer();
+    if (!container) throw new Error("未找到当前题目容器");
+    const fieldset = container.querySelector("fieldset");
+    if (!fieldset) throw new Error("未找到题目 fieldset");
+    const type = detectQuestionType(fieldset);
 
     if (type === "fill") {
       fillTextQuestion(fieldset, answer);
     } else if (type === "choice") {
       clickChoices(fieldset, answer, false);
     } else if (type === "multi") {
-      // 先清空所有勾选
       fieldset.querySelectorAll('input[type="checkbox"]').forEach(cb => {
         cb.checked = false;
         cb.dispatchEvent(new Event("change", { bubbles: true }));
       });
-      const matched = clickChoices(fieldset, answer, true);
-      console.log(`[SNNUBBAF] 多选已勾选: ${matched.join("; ")}`);
+      clickChoices(fieldset, answer, true);
     } else {
-      throw new Error("无法识别题型");
+      throw new Error("无法识别题型: " + type);
     }
-
-    return answer;
   }
 
-  // ── 自动翻页：翻页 + 等待 ────────────────────────
+  // ── API ────────────────────────────────────────────
 
-  function getNextPageButton() {
-    return document.querySelector("#navpaging_bottom > button:nth-child(5)");
+  async function fetchBatchAnswers(questions) {
+    const resp = await fetch(API_URL + "/batch-ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ questions }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || `API 返回 ${resp.status}`);
+    }
+    const data = await resp.json();
+    if (!Array.isArray(data.answers)) throw new Error("API 返回格式错误");
+    return data.answers;
   }
 
-  async function autoPageTurn() {
-    if (!isAutoPage()) return;
+  // ── 收集阶段 ──────────────────────────────────────
 
-    // 错误次数上限
-    if (getErrCount() >= MAX_ERR) {
-      console.warn("[SNNUBBAF] 连续错误次数超限，停止自动翻页");
-      cleanAutoPage();
-      registerAutoPageMenus();
-      window.alert("连续出错已达上限，自动翻页已停止。");
-      return;
+  async function handleCollecting() {
+    try {
+      const q = extractCurrentQuestion();
+      const questions = JSON.parse(sessionStorage.getItem(QUESTIONS_KEY) || "[]");
+      questions.push(q);
+      sessionStorage.setItem(QUESTIONS_KEY, JSON.stringify(questions));
+      console.log(`[SNNUBBAF] 收集第 ${questions.length} 题: ${q.typeLabel} | ${q.question.slice(0, 50)}...`);
+
+      if (questions.length >= MAX_PAGES) {
+        console.warn(`[SNNUBBAF] 已达 ${MAX_PAGES} 题上限`);
+      }
+
+      const nextBtn = getNextPageButton();
+      if (nextBtn && questions.length < MAX_PAGES) {
+        // 还有下一页，继续收集
+        setTimeout(() => nextBtn.click(), 500);
+      } else {
+        // 全部收集完毕，批量请求答案
+        console.log(`[SNNUBBAF] 共收集 ${questions.length} 题，正在请求答案...`);
+        const answersFromAPI = await fetchBatchAnswers(questions);
+
+        // 按 index 对齐答案
+        const answerList = questions.map((_q, i) => {
+          const found = answersFromAPI.find(a => a.index === i);
+          return found ? found.answer : null;
+        });
+
+        sessionStorage.setItem(ANSWERS_KEY, JSON.stringify(answerList));
+        sessionStorage.setItem(FILL_IDX_KEY, "0");
+        setMode("filling");
+
+        // 回到第一页
+        const firstBtn = getFirstPageButton();
+        if (firstBtn) {
+          console.log("[SNNUBBAF] 答案已获取，返回第一题...");
+          setTimeout(() => firstBtn.click(), 500);
+        } else {
+          // 已在第一页（或只有 1 题），直接填充
+          handleFilling();
+        }
+      }
+    } catch (e) {
+      console.error("[SNNUBBAF] 收集阶段出错:", e.message);
+      cleanup();
+      window.alert(`收集题目失败: ${e.message}`);
     }
-
-    // 查找下一页按钮
-    const nextBtn = getNextPageButton();
-    if (!nextBtn) {
-      // 没有下一页 → 答题结束
-      const totalTurns = getTurnCount();
-      cleanAutoPage();
-      registerAutoPageMenus();
-      registerToggleMenu();
-      state.isRunning = false;
-      state.isProcessing = false;
-      console.log(`[SNNUBBAF] 自动翻页完成，共处理 ${totalTurns} 页`);
-      window.alert(`答题完毕！共处理 ${totalTurns} 页。`);
-      return;
-    }
-
-    // 激活次数上限
-    const tc = getTurnCount();
-    if (tc >= MAX_TURNS) {
-      cleanAutoPage();
-      registerAutoPageMenus();
-      registerToggleMenu();
-      state.isRunning = false;
-      state.isProcessing = false;
-      console.log(`[SNNUBBAF] 已达 ${MAX_TURNS} 页上限`);
-      window.alert(`已处理 ${MAX_TURNS} 页，达到自动翻页上限，已停止。`);
-      return;
-    }
-
-    // 等待 2 秒后点击下一页
-    console.log("[SNNUBBAF] 等待 2 秒后翻页...");
-    state.apTimer = setTimeout(() => {
-      if (!isAutoPage()) return; // 用户可能在此期间停止了
-      sessionStorage.setItem(TC_KEY, String(tc + 1));
-      console.log("[SNNUBBAF] 点击下一页...");
-      nextBtn.click();
-    }, 2000);
   }
 
-  // ── 主 流 程 ──────────────────────────────────────
+  // ── 填充阶段 ──────────────────────────────────────
 
-  async function startExecution(fromAutoPage) {
-    if (state.isProcessing) {
-      window.alert("脚本正在执行，请稍候。");
+  function handleFilling() {
+    const answers = JSON.parse(sessionStorage.getItem(ANSWERS_KEY) || "[]");
+    const idx = parseInt(sessionStorage.getItem(FILL_IDX_KEY) || "0", 10);
+
+    if (idx >= answers.length) {
+      const total = answers.length;
+      cleanup();
+      console.log(`[SNNUBBAF] 全部 ${total} 题填充完毕`);
+      window.alert(`填充完毕！共 ${total} 题。`);
       return;
     }
-    state.isRunning = true;
-    state.isProcessing = true;
-    if (!fromAutoPage) registerToggleMenu();
 
     try {
-      await processQuestion();
-      state.isRunning = false;
-      state.isProcessing = false;
-      if (!fromAutoPage) registerToggleMenu();
-
-      // 自动翻页逻辑
-      if (fromAutoPage || isAutoPage()) {
-        await autoPageTurn();
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("[SNNUBBAF] 错误:", msg);
-      state.isRunning = false;
-      state.isProcessing = false;
-
-      if (fromAutoPage || isAutoPage()) {
-        // 自动翻页模式 → 记录错误但不弹窗，直接翻页
-        const ec = getErrCount() + 1;
-        sessionStorage.setItem(EC_KEY, String(ec));
-        console.warn(`[SNNUBBAF] 自动翻页模式出错 (${ec}/${MAX_ERR})`);
-        await autoPageTurn();
+      const answer = answers[idx];
+      if (answer) {
+        console.log(`[SNNUBBAF] 填充第 ${idx + 1}/${answers.length} 题: ${answer}`);
+        fillCurrentQuestion(answer);
+        sessionStorage.setItem(ERR_KEY, "0");
       } else {
-        registerToggleMenu();
-        window.alert(`执行失败，已停止。\n原因: ${msg}`);
+        console.warn(`[SNNUBBAF] 第 ${idx + 1} 题无答案，跳过`);
       }
+    } catch (e) {
+      console.error(`[SNNUBBAF] 填充第 ${idx + 1} 题出错:`, e.message);
+      const ec = parseInt(sessionStorage.getItem(ERR_KEY) || "0", 10) + 1;
+      sessionStorage.setItem(ERR_KEY, String(ec));
+      if (ec >= MAX_ERR) {
+        cleanup();
+        window.alert(`连续出错 ${MAX_ERR} 次，已停止。\n最后错误: ${e.message}`);
+        return;
+      }
+    }
+
+    // 前进到下一题
+    sessionStorage.setItem(FILL_IDX_KEY, String(idx + 1));
+    const nextBtn = getNextPageButton();
+    if (nextBtn && idx + 1 < answers.length) {
+      setTimeout(() => nextBtn.click(), 1000);
+    } else {
+      const total = answers.length;
+      cleanup();
+      console.log(`[SNNUBBAF] 全部 ${total} 题填充完毕`);
+      window.alert(`填充完毕！共 ${total} 题。`);
     }
   }
 
-  // ── 启 动 ─────────────────────────────────────────
+  // ── 启动批量填充 ──────────────────────────────────
 
-  registerToggleMenu();
-  registerAutoPageMenus();
+  function startBatchExecution() {
+    cleanup();
+    sessionStorage.setItem(QUESTIONS_KEY, "[]");
+
+    // 先回到第一页，再开始收集
+    const firstBtn = getFirstPageButton();
+    if (firstBtn) {
+      setMode("pre-collecting");
+      console.log("[SNNUBBAF] 正在回到第一页...");
+      setTimeout(() => firstBtn.click(), 300);
+    } else {
+      // 已在第一页（或无分页），直接开始收集
+      setMode("collecting");
+      handleCollecting();
+    }
+  }
+
+  // ── ❤ 按钮注入 ────────────────────────────────────
+
+  function injectButton() {
+    const anchor = document.querySelector("#navpaging_bottom > span:nth-child(3)");
+    if (!anchor || document.getElementById("snnubbaf-heart-btn")) return;
+
+    const btn = document.createElement("span");
+    btn.id = "snnubbaf-heart-btn";
+    btn.textContent = "❤";
+    btn.title = "连续自动填充";
+    btn.style.cssText =
+      "cursor:pointer;font-size:24px;vertical-align:middle;margin-left:8px;color:#e74c3c;user-select:none;";
+    btn.addEventListener("click", () => {
+      if (getMode()) {
+        window.alert("正在执行中，请稍候。");
+        return;
+      }
+      startBatchExecution();
+    });
+    anchor.after(btn);
+  }
+
+  injectButton();
+  const btnTimer = setInterval(injectButton, 1500);
+  setTimeout(() => clearInterval(btnTimer), 30000);
+
+  // ── 菜单 ──────────────────────────────────────────
+
+  GM_REG("连续自动填充", () => {
+    if (getMode()) {
+      window.alert("正在执行中，请稍候。");
+      return;
+    }
+    startBatchExecution();
+  });
+
+  GM_REG("停止", () => {
+    cleanup();
+    console.log("[SNNUBBAF] 用户手动停止");
+    window.alert("已停止。");
+  });
+
+  // ── 初始化 ─────────────────────────────────────────
+
   console.log("[SNNUBBAF] 脚本已加载 | API: " + API_URL);
 
-  // 页面加载时，如果 snnubbaf=1 则自动开始
-  if (isAutoPage()) {
-    const tc = getTurnCount();
-    console.log(`[SNNUBBAF] 检测到自动翻页模式（第 ${tc + 1} 页），自动开始`);
-    startExecution(true);
-  }
+  // 页面加载后恢复执行状态（跨页保活）
+  setTimeout(() => {
+    const mode = getMode();
+    if (mode === "pre-collecting") {
+      // 已到达第一页，开始收集
+      setMode("collecting");
+      sessionStorage.setItem(QUESTIONS_KEY, "[]");
+      console.log("[SNNUBBAF] 已到达第一页，开始收集题目...");
+      handleCollecting();
+    } else if (mode === "collecting") {
+      handleCollecting();
+    } else if (mode === "filling") {
+      handleFilling();
+    }
+  }, 800);
 })();

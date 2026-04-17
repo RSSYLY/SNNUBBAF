@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SNNUBBAF
 // @namespace    https://bb.snnu.edu.cn/
-// @version      0.5.1
-// @description  给宝宝解放双手
+// @version      1.0.0
+// @description  给宝宝解放双手（NotebookLM 批量版）
 // @match        https://bb.snnu.edu.cn/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_unregisterMenuCommand
