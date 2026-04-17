@@ -38,6 +38,7 @@
   const ANSWERS_KEY  = "snnubbaf_answers";      // JSON: [answer, ...]
   const FILL_IDX_KEY = "snnubbaf_fill_idx";     // 当前填充位置
   const ERR_KEY      = "snnubbaf_err_count";    // 连续错误计数
+  const START_IDX_KEY = "snnubbaf_start_idx";    // 起始题号 (1-based)
   const MAX_ERR      = 5;
   const MAX_PAGES    = 100;
 
@@ -50,7 +51,7 @@
   function getMode()  { return sessionStorage.getItem(MODE_KEY); }
   function setMode(m) { m ? sessionStorage.setItem(MODE_KEY, m) : sessionStorage.removeItem(MODE_KEY); }
   function cleanup() {
-    [MODE_KEY, QUESTIONS_KEY, ANSWERS_KEY, FILL_IDX_KEY, ERR_KEY]
+    [MODE_KEY, QUESTIONS_KEY, ANSWERS_KEY, FILL_IDX_KEY, ERR_KEY, START_IDX_KEY]
       .forEach(k => sessionStorage.removeItem(k));
   }
 
@@ -144,14 +145,37 @@
 
   // ── 导航 ──────────────────────────────────────────
 
-  function getNextPageButton() {
-    const btn = document.querySelector("#navpaging_bottom > button:nth-child(5)");
-    return btn && !btn.disabled ? btn : null;
+  /** 获取总题目数量 */
+  function getTotalQuestions() {
+    const span = document.querySelector("#navpaging_bottom > span");
+    if (!span) return 0;
+    const m = span.textContent.match(/共\s*(\d+)\s*个/);
+    return m ? parseInt(m[1], 10) : 0;
   }
 
-  function getFirstPageButton() {
-    const btn = document.querySelector("#navpaging_bottom > button:nth-child(1)");
-    return btn && !btn.disabled ? btn : null;
+  /** 获取当前题号（1-based） */
+  function getCurrentQuestionIndex() {
+    const strong = document.querySelector("#navpaging_bottom > span > strong:first-of-type");
+    return strong ? parseInt(strong.textContent, 10) : 0;
+  }
+
+  /** 跳转到第 n 题（1-based），通过题号列表按钮 */
+  function navigateToQuestion(n) {
+    // 使用页面原生 navigate 函数
+    if (typeof window.navigate === "function") {
+      window.navigate("question_num_" + n);
+      return true;
+    }
+    // 备选：通过顶部题号列表点击
+    const topBtn = document.querySelector("#topbar > div > div.timedQuestionStatus > h3 > button");
+    if (topBtn) topBtn.click();
+    const xpath = `/html/body/div/div/div/div[2]/form/div[2]/div/div[3]/div/div/button[${n}]/span`;
+    const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+    if (result.singleNodeValue) {
+      result.singleNodeValue.click();
+      return true;
+    }
+    return false;
   }
 
   // ── 填 写 ─────────────────────────────────────────
@@ -242,19 +266,33 @@
 
   // ── API ────────────────────────────────────────────
 
-  async function fetchBatchAnswers(questions) {
-    const resp = await fetch(API_URL + "/batch-ask", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ questions }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || `API 返回 ${resp.status}`);
+  const MAX_RETRIES = 2;
+  const RETRY_DELAY = 3000;  // ms
+
+  async function fetchBatchAnswers(questions, retries = MAX_RETRIES) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const resp = await fetch(API_URL + "/batch-ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ questions }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.error || `API 返回 ${resp.status}`);
+        }
+        const data = await resp.json();
+        if (!Array.isArray(data.answers)) throw new Error("API 返回格式错误");
+        return data.answers;
+      } catch (e) {
+        if (attempt < retries) {
+          console.warn(`[SNNUBBAF] API 请求失败 (${attempt + 1}/${retries + 1}): ${e.message}，${RETRY_DELAY / 1000}s 后重试...`);
+          await new Promise(r => setTimeout(r, RETRY_DELAY));
+        } else {
+          throw e;  // 最后一次仍失败，向上抛出
+        }
+      }
     }
-    const data = await resp.json();
-    if (!Array.isArray(data.answers)) throw new Error("API 返回格式错误");
-    return data.answers;
   }
 
   // ── 收集阶段 ──────────────────────────────────────
@@ -265,22 +303,19 @@
       const questions = JSON.parse(sessionStorage.getItem(QUESTIONS_KEY) || "[]");
       questions.push(q);
       sessionStorage.setItem(QUESTIONS_KEY, JSON.stringify(questions));
-      console.log(`[SNNUBBAF] 收集第 ${questions.length} 题: ${q.typeLabel} | ${q.question.slice(0, 50)}...`);
 
-      if (questions.length >= MAX_PAGES) {
-        console.warn(`[SNNUBBAF] 已达 ${MAX_PAGES} 题上限`);
-      }
+      const curIdx = getCurrentQuestionIndex();
+      const total = getTotalQuestions();
+      console.log(`[SNNUBBAF] 收集第 ${questions.length}/${total} 题 (页${curIdx}): ${q.typeLabel} | ${q.question.slice(0, 50)}...`);
 
-      const nextBtn = getNextPageButton();
-      if (nextBtn && questions.length < MAX_PAGES) {
-        // 还有下一页，继续收集
-        setTimeout(() => nextBtn.click(), 500);
-      } else {
+      const startIdx = parseInt(sessionStorage.getItem(START_IDX_KEY) || "1", 10);
+      const targetCount = total - startIdx + 1;
+
+      if (questions.length >= targetCount || questions.length >= MAX_PAGES) {
         // 全部收集完毕，批量请求答案
-        console.log(`[SNNUBBAF] 共收集 ${questions.length} 题，正在请求答案...`);
+        console.log(`[SNNUBBAF] 共收集 ${questions.length} 题（从第 ${startIdx} 题起），正在请求答案...`);
         const answersFromAPI = await fetchBatchAnswers(questions);
 
-        // 按 index 对齐答案
         const answerList = questions.map((_q, i) => {
           const found = answersFromAPI.find(a => a.index === i);
           return found ? found.answer : null;
@@ -290,15 +325,13 @@
         sessionStorage.setItem(FILL_IDX_KEY, "0");
         setMode("filling");
 
-        // 回到第一页
-        const firstBtn = getFirstPageButton();
-        if (firstBtn) {
-          console.log("[SNNUBBAF] 答案已获取，返回第一题...");
-          setTimeout(() => firstBtn.click(), 500);
-        } else {
-          // 已在第一页（或只有 1 题），直接填充
-          handleFilling();
-        }
+        // 跳到起始题开始填充
+        console.log(`[SNNUBBAF] 答案已获取，跳转第 ${startIdx} 题...`);
+        navigateToQuestion(startIdx);
+      } else {
+        // 跳到下一题继续收集
+        const nextNum = curIdx + 1;
+        setTimeout(() => navigateToQuestion(nextNum), 500);
       }
     } catch (e) {
       console.error("[SNNUBBAF] 收集阶段出错:", e.message);
@@ -311,6 +344,7 @@
 
   function handleFilling() {
     const answers = JSON.parse(sessionStorage.getItem(ANSWERS_KEY) || "[]");
+    const questions = JSON.parse(sessionStorage.getItem(QUESTIONS_KEY) || "[]");
     const idx = parseInt(sessionStorage.getItem(FILL_IDX_KEY) || "0", 10);
 
     if (idx >= answers.length) {
@@ -320,6 +354,29 @@
       window.alert(`填充完毕！共 ${total} 题。`);
       return;
     }
+
+    // 题号校验：当前页面的题号应与 idx 对齐
+    const startIdx = parseInt(sessionStorage.getItem(START_IDX_KEY) || "1", 10);
+    const pageIdx = getCurrentQuestionIndex();  // 1-based
+    const expectedPage = startIdx + idx;        // 1-based
+    if (pageIdx && pageIdx !== expectedPage) {
+      console.warn(`[SNNUBBAF] 题号不匹配！页面=${pageIdx}, 期望=${expectedPage}，跳转修正...`);
+      navigateToQuestion(expectedPage);
+      return;  // navigate 会重载页面，届时再次进入 handleFilling
+    }
+
+    // 题目内容校验（用标题前 20 字比对）
+    try {
+      const currentQ = extractCurrentQuestion();
+      const expectedQ = questions[idx];
+      if (expectedQ) {
+        const curTitle = currentQ.question.slice(0, 20);
+        const expTitle = expectedQ.question.slice(0, 20);
+        if (curTitle !== expTitle) {
+          console.warn(`[SNNUBBAF] 题目内容不匹配！第 ${idx + 1} 题\n  页面: ${curTitle}...\n  期望: ${expTitle}...`);
+        }
+      }
+    } catch (_e) { /* 校验失败不阻断填充 */ }
 
     try {
       const answer = answers[idx];
@@ -343,9 +400,8 @@
 
     // 前进到下一题
     sessionStorage.setItem(FILL_IDX_KEY, String(idx + 1));
-    const nextBtn = getNextPageButton();
-    if (nextBtn && idx + 1 < answers.length) {
-      setTimeout(() => nextBtn.click(), 1000);
+    if (idx + 1 < answers.length) {
+      setTimeout(() => navigateToQuestion(startIdx + idx + 1), 1000);
     } else {
       const total = answers.length;
       cleanup();
@@ -359,45 +415,19 @@
   function startBatchExecution() {
     cleanup();
     sessionStorage.setItem(QUESTIONS_KEY, "[]");
+    sessionStorage.setItem(START_IDX_KEY, "1");
 
-    // 先回到第一页，再开始收集
-    const firstBtn = getFirstPageButton();
-    if (firstBtn) {
+    // 跳到第 1 题开始收集
+    const curIdx = getCurrentQuestionIndex();
+    if (curIdx !== 1) {
       setMode("pre-collecting");
-      console.log("[SNNUBBAF] 正在回到第一页...");
-      setTimeout(() => firstBtn.click(), 300);
+      console.log("[SNNUBBAF] 正在跳转到第 1 题...");
+      navigateToQuestion(1);
     } else {
-      // 已在第一页（或无分页），直接开始收集
       setMode("collecting");
       handleCollecting();
     }
   }
-
-  // ── ❤ 按钮注入 ────────────────────────────────────
-
-  function injectButton() {
-    const anchor = document.querySelector("#navpaging_bottom > span:nth-child(3)");
-    if (!anchor || document.getElementById("snnubbaf-heart-btn")) return;
-
-    const btn = document.createElement("span");
-    btn.id = "snnubbaf-heart-btn";
-    btn.textContent = "❤";
-    btn.title = "连续自动填充";
-    btn.style.cssText =
-      "cursor:pointer;font-size:24px;vertical-align:middle;margin-left:8px;color:#e74c3c;user-select:none;";
-    btn.addEventListener("click", () => {
-      if (getMode()) {
-        window.alert("正在执行中，请稍候。");
-        return;
-      }
-      startBatchExecution();
-    });
-    anchor.after(btn);
-  }
-
-  injectButton();
-  const btnTimer = setInterval(injectButton, 1500);
-  setTimeout(() => clearInterval(btnTimer), 30000);
 
   // ── 菜单 ──────────────────────────────────────────
 
@@ -407,6 +437,25 @@
       return;
     }
     startBatchExecution();
+  });
+
+  GM_REG("从当前题开始填充", () => {
+    if (getMode()) {
+      window.alert("正在执行中，请稍候。");
+      return;
+    }
+    const curIdx = getCurrentQuestionIndex();
+    const total = getTotalQuestions();
+    if (!curIdx || !total) {
+      window.alert("无法获取当前题号信息，请确认在答题页面中。");
+      return;
+    }
+    console.log(`[SNNUBBAF] 从第 ${curIdx}/${total} 题开始收集与填充`);
+    cleanup();
+    sessionStorage.setItem(QUESTIONS_KEY, "[]");
+    sessionStorage.setItem(START_IDX_KEY, String(curIdx));
+    setMode("collecting");
+    handleCollecting();
   });
 
   GM_REG("停止", () => {
@@ -423,10 +472,9 @@
   setTimeout(() => {
     const mode = getMode();
     if (mode === "pre-collecting") {
-      // 已到达第一页，开始收集
+      // 已到达第一题，开始收集
       setMode("collecting");
-      sessionStorage.setItem(QUESTIONS_KEY, "[]");
-      console.log("[SNNUBBAF] 已到达第一页，开始收集题目...");
+      console.log("[SNNUBBAF] 已到达第 1 题，开始收集题目...");
       handleCollecting();
     } else if (mode === "collecting") {
       handleCollecting();
