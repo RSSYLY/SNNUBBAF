@@ -77,13 +77,15 @@ async function ensureConnected() {
   if (nbConnected) return;
   console.log("[NotebookLM] 正在连接...");
   await nbClient.connect({ transport: "auto" });
-  nbConnected = true;
   console.log("[NotebookLM] 已连接，transport:", nbClient.getTransportMode());
 
   // 获取笔记本来源
   const detail = await nbClient.getNotebookDetail(CONFIG.notebookId);
-  nbSourceIds = detail.sources.map((s) => s.id);
+  nbSourceIds = (detail.sources ?? []).map((s) => s.id);
   console.log(`[NotebookLM] 笔记本 "${detail.title}"，来源: ${nbSourceIds.length} 个`);
+
+  // 全部初始化成功后再标记已连接
+  nbConnected = true;
 }
 
 // ============================================================

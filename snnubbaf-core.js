@@ -40,7 +40,7 @@
   const ERR_KEY      = "snnubbaf_err_count";    // 连续错误计数
   const START_IDX_KEY = "snnubbaf_start_idx";    // 起始题号 (1-based)
   const MAX_ERR      = 5;
-  const MAX_PAGES    = 100;
+  const MAX_PAGES    = 30;
 
   const TYPE_LABELS = {
     choice: "单选题", fill: "填空题", multi: "多选题", unknown: "未知题型",
